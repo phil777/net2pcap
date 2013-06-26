@@ -3,7 +3,8 @@
  *              see http://www.secdev.org/projects/net2pcap.html
  *              for more informations
  *
- * Copyright (C) 2003-2011  Philippe Biondi <phil@secdev.org>
+ * Copyright (C) 2003-2013  Philippe Biondi <phil@secdev.org>
+ *                          Nicolas Bareil <nico@chdir.org>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -15,12 +16,12 @@
  * Lesser General Public License for more details.
  */
 
-#define IDENT "net2pcap -- http://www.secdev.org/projects/net2pcap.html\n"
+#define IDENT "##PACKAGE_NAME -- ## PACKAGE_URL\n"
 
 #define _FILE_OFFSET_BITS 64
+#include "config.h"
 
 #include <sys/types.h>
-#include <asm/types.h>
 #include <sys/socket.h>
 #include <netpacket/packet.h>
 #include <net/if.h>
@@ -28,24 +29,39 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
-#include <linux/if_ether.h>
+#include <netinet/if_ether.h>
 #include <getopt.h>
 #include <stdio.h>
+#include <ctype.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <sys/select.h>
+#include <sys/signalfd.h>
+#include <sys/types.h>
+#include <pwd.h>
+#include <grp.h>
 #include <signal.h>
 #include <stdlib.h>
+#if HAVE_SECCOMP_H
+#        include <seccomp.h>
+#endif
 #include <syslog.h>
 #include <string.h>
 #include <unistd.h>
+
+#ifndef O_LARGEFILE /* needed for SECCOMP rule */
+#        define O_LARGEFILE    00100000
+#endif
+
+#define MAX(a,b) (a > b ? a : b)
 
 #define DEFAULT_SNAPLEN 65535
 #define MAX_LEN_ERRORMSG 2048
 
 #if __BYTE_ORDER == __BIG_ENDIAN
-#        define NATIVE2COMPAT(x) (sizeof(struct timeval) != 8 ? (__u32)(x >> 32) : (x))
+#        define NATIVE2COMPAT(x) (sizeof(struct timeval) != 8 ? (uint32_t)(x >> 32) : (x))
 #else
-#        define NATIVE2COMPAT(x) ((__u32)(x))
+#        define NATIVE2COMPAT(x) ((uint32_t)(x))
 #endif
 
 int daemonize = 0;
@@ -67,26 +83,26 @@ void PERROR(char *err) {
 #define CRATIONMASK (S_IRUSR|S_IWUSR)
 
 struct timeval_compat {
-        __u32 tv_sec;     /* seconds */
-        __u32 tv_usec;    /* microseconds */
+        uint32_t tv_sec;     /* seconds */
+        uint32_t tv_usec;    /* microseconds */
 };
 
 /* From pcap.h */
 
 struct pcap_file_header {
-	__u32 magic;
-	__u16 version_major;
-	__u16 version_minor;
-	__s32 thiszone;     /* gmt to local correction */
-	__u32 sigfigs;    /* accuracy of timestamps */
-	__u32 snaplen;    /* max length saved portion of each pkt */
-	__u32 linktype;   /* data link type (LINKTYPE_*) */
+	uint32_t magic;
+	uint16_t version_major;
+	uint16_t version_minor;
+	int32_t thiszone;     /* gmt to local correction */
+	uint32_t sigfigs;    /* accuracy of timestamps */
+	uint32_t snaplen;    /* max length saved portion of each pkt */
+	uint32_t linktype;   /* data link type (LINKTYPE_*) */
 };
 
 struct pcap_pkthdr {
 	struct timeval_compat ts;      /* time stamp using 32 bits fields */
-	__u32 caplen;     /* length of portion present */
-	__u32 len;        /* length this packet (off wire) */
+	uint32_t caplen;     /* length of portion present */
+	uint32_t len;        /* length this packet (off wire) */
 };
 
 
@@ -227,22 +243,24 @@ void xwrite(int fd, void *buf, size_t len) {
         } while (remaining > 0);
 }
 
+int only_digits(char *s) {
+        char c;
+        int nondigit_found = 0;
 
-volatile sig_atomic_t term_received = 0, hup_received = 0;
+        while (c = *s++) {
+                if (! isdigit(c)) {
+                        nondigit_found = 1;
+                }
+        }
 
-void term_handler(int x)
-{
-	term_received = 1;
+        return !nondigit_found;
 }
 
-void hup_handler(int x)
-{
-	hup_received = 1;
-}
+int term_received = 0, hup_received = 0;
 
 int main(int argc, char *argv[])
 {
-	int s,l;
+	int s, l, sigfd;
 	int ptype = ETH_P_ALL;
 	char *iff = NULL;
         char *newroot = NULL;
@@ -256,29 +274,34 @@ int main(int argc, char *argv[])
 	struct sockaddr_ll sll;
 	struct pcap_file_header hdr;
 	struct pcap_pkthdr phdr;
+        struct passwd *user_entry;
+        struct group *group_entry;
 	struct timeval native_tv;
 	struct timezone tz;
-	struct sigaction sa;
+        struct signalfd_siginfo sigfdinfo;
+        sigset_t mask;
 	int xdump = 0;
 	unsigned long long int pktnb = 0;
 	int linktype;
         uid_t uid = 0;
         gid_t gid = 0;
+        fd_set readset;
+#if HAVE_SECCOMP_H
+        scmp_filter_ctx ctx;
+#endif
 
-	sa.sa_handler = &term_handler;
-	if (sigemptyset(&sa.sa_mask) == -1) ERROR("sigemptyset");
-	sa.sa_flags= SA_RESTART;
-	if (sigaction(SIGTERM, &sa, NULL) == -1) PERROR("sigaction(term)");
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGINT);
+        sigaddset(&mask, SIGTERM);
+        sigaddset(&mask, SIGQUIT);
+        sigaddset(&mask, SIGHUP);
 
-	sa.sa_handler = &term_handler;
-	if (sigemptyset(&sa.sa_mask) == -1) ERROR("sigemptyset");
-	sa.sa_flags= SA_RESTART;
-	if (sigaction(SIGINT, &sa, NULL) == -1) PERROR("sigaction(int)");
+        if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1)
+                PERROR("sigprocmask()");
 
-	sa.sa_handler = &hup_handler;
-	if (sigemptyset(&sa.sa_mask) == -1) ERROR("sigemptyset");
-	sa.sa_flags= SA_RESTART;
-	if (sigaction(SIGHUP, &sa, NULL) == -1) PERROR("sigaction(hup)");
+        sigfd = signalfd(-1, &mask, 0);
+        if (sigfd == -1)
+                PERROR("signalfd()");
 
 	/* Get options */
 
@@ -312,15 +335,43 @@ int main(int argc, char *argv[])
 			break;
                 case 'u':
                         errno = 0;
-                        uid = strtoul(optarg, NULL,0);
-                        if (errno)
-                                PERROR("invalid uid");
+                        if (only_digits(optarg)) {
+                                uid = strtoul(optarg, NULL, 0);
+                                if (errno) {
+                                        PERROR("Invalid uid");
+                                }
+                        } else {
+                                errno = 0;
+                                user_entry = getpwnam(optarg);
+                                if (user_entry == NULL) {
+                                        if (errno) {
+                                                PERROR("getpwent()");
+                                        } else {
+                                                ERROR("Username not found\n");
+                                        }
+                                }
+                                uid = user_entry->pw_uid;
+                        }
                         break;
                 case 'g':
                         errno = 0;
-                        gid = strtoul(optarg, NULL,0);
-                        if (errno)
-                                PERROR("invalid gid");
+                        if (only_digits(optarg)) {
+                                gid = strtoul(optarg, NULL, 0);
+                                if (errno) {
+                                        ERROR("Invalid gid");
+                                }
+                        } else {
+                                errno = 0;
+                                group_entry = getgrnam(optarg);
+                                if (group_entry == NULL) {
+                                        if (errno) {
+                                                PERROR("getgrnam()");
+                                        } else {
+                                                ERROR("Group name not found\n");
+                                        }
+                                }
+                                gid = group_entry->gr_gid;
+                        }
                         break;
 		case 'x':
 			xdump = 1;
@@ -383,13 +434,66 @@ int main(int argc, char *argv[])
                         PERROR("chdir(/)");
         }
 
+        if (uid && !gid) {
+                /*
+                 * uid set but gid not, good behavior is to
+                 * set gid to primary group of uid
+                 */
+                errno = 0;
+                user_entry = getpwuid(uid);
+                if (!user_entry) {
+                        if (errno)
+                                PERROR("getpwuid()");
+                        else
+                                ERROR("uid %d does not exist,"
+                                      " cannot find primary group\n",
+                                      uid);
+                }
+                gid = user_entry->pw_gid;
+        }
+
         if (gid && (setgid(gid) == -1))
                 PERROR("setgid()");
 
         if (uid && (setuid(uid) == -1))
                 PERROR("setuid()");
 
-	LOG(LOG_INFO,"Started.\n");
+#if HAVE_SECCOMP_H
+        ctx = seccomp_init(SCMP_ACT_KILL);
+
+        if (ctx == NULL)
+                ERROR("Cannot go into SECCOMPv2");
+
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
+                         SCMP_A1(SCMP_CMP_EQ, O_CREAT|O_WRONLY|O_APPEND|O_LARGEFILE));
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socketcall), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(gettimeofday), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(_llseek), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(_newselect), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
+        seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sigreturn), 0);
+
+        if (daemonize) {
+                seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(time), 0);
+                seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat64), 0);
+                seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap2), 0);
+                seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
+        }
+
+        if (seccomp_load(ctx) < 0)
+                ERROR("Cannot load SECCOMP filters");
+
+        LOG(LOG_INFO,"Started [sandboxed].\n");
+        seccomp_release(ctx);
+#else
+        LOG(LOG_INFO,"Started.\n");
+#endif /* HAVE_SECCOMP_H */
+
 
 	while (!term_received) { /* Main loop */
                 off_t filepos;
@@ -415,22 +519,51 @@ int main(int argc, char *argv[])
         	hup_received = 0;
 		pktnb = 0;
         	while (!hup_received && !term_received) {  /* Receive loop */
-                        ssize_t rcvdlen = recv(s, buf, snaplen, 0);
-                        if (rcvdlen == -1)
-                                PERROR("recv");
-                        if (xdump && !daemonize)
-                                hexdump(buf, rcvdlen);
-                        gettimeofday(&native_tv, NULL);
+                        FD_ZERO(&readset);
+                        FD_SET(s, &readset);
+                        FD_SET(sigfd, &readset);
 
-                        phdr.ts.tv_sec  = NATIVE2COMPAT(native_tv.tv_sec);
-                        phdr.ts.tv_usec = NATIVE2COMPAT(native_tv.tv_usec);
+                        if (select(MAX(s, sigfd) + 1, &readset, NULL, NULL, NULL) == -1)
+                                PERROR("select()");
 
-                        phdr.len    = rcvdlen;
-                        phdr.caplen = rcvdlen;
+                        if (FD_ISSET(s, &readset))
+                        {
+                                ssize_t rcvdlen = recv(s, buf, snaplen, 0);
+                                if (rcvdlen == -1)
+                                        PERROR("recv");
+                                if (xdump && !daemonize)
+                                        hexdump(buf, rcvdlen);
+                                gettimeofday(&native_tv, NULL);
 
-                        xwrite(f, &phdr, sizeof(phdr));
-                        xwrite(f, buf, rcvdlen);
-                        pktnb++;
+                                phdr.ts.tv_sec  = NATIVE2COMPAT(native_tv.tv_sec);
+                                phdr.ts.tv_usec = NATIVE2COMPAT(native_tv.tv_usec);
+
+                                phdr.len    = rcvdlen;
+                                phdr.caplen = rcvdlen;
+
+                                xwrite(f, &phdr, sizeof(phdr));
+                                xwrite(f, buf, rcvdlen);
+                                pktnb++;
+                        }
+
+                        if (FD_ISSET(sigfd, &readset))
+                        {
+                                if (read(sigfd, &sigfdinfo, sizeof(sigfdinfo)) != sizeof(sigfdinfo))
+                                        PERROR("read(signalfd_siginfo)");
+
+                                switch (sigfdinfo.ssi_signo)
+                                {
+                                        case SIGINT:
+                                        case SIGTERM:
+                                                term_received = 1;
+                                                break;
+                                        case SIGHUP:
+                                                hup_received = 1;
+                                                break;
+                                        default:
+                                                ERROR("signal %d received", sigfdinfo.ssi_signo);
+                                }
+                        }
         	}
 		LOG(LOG_INFO,"Received %lld packets\n", pktnb);
         	if (close(f) == -1) PERROR("close");
